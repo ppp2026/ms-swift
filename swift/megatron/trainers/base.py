@@ -13,7 +13,6 @@ from functools import partial
 from mcore_bridge import LoraParallelLinear
 from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
-from megatron.core.distributed import FullyShardedDataParallel as megatron_FSDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.pipeline_parallel import get_forward_backward_func
@@ -109,6 +108,21 @@ class BaseMegatronTrainer(ABC):
 
     def _load_checkpoint(self):
         args = self.args
+
+        # TTP emergency checkpoint resume (priority over mcore_model/mcore_adapter)
+        if getattr(args, 'ttp_resume_from', None):
+            if args.finetune:
+                raise ValueError('[TTP RESUME] Set --finetune false for checkpoint resume')
+            from swift.megatron.ttp.tft_emergency_resume import (
+                load_ttp_model_and_common_state,
+            )
+            payload = load_ttp_model_and_common_state(self, args.ttp_resume_from)
+            self.state.iteration = int(payload['common']['iteration'])
+            self.state.consumed_train_samples = int(
+                payload['common'].get('consumed_train_samples', 0)
+            )
+            return
+
         if not args.finetune:
             self.state.iteration = self._load_iteration()
         if args.mcore_model is not None:
@@ -595,7 +609,7 @@ class BaseMegatronTrainer(ABC):
                 self._prepare_vit_gradient_checkpointing(m)
 
         config.grad_scale_func = self.optimizer.scale_loss
-        if isinstance(self.wrapped_models[0], (DDP, megatron_FSDP)) and args.overlap_grad_reduce:
+        if isinstance(self.wrapped_models[0], DDP) and args.overlap_grad_reduce:
             assert config.no_sync_func is None, ('When overlap_grad_reduce is True, config.no_sync_func must be None; '
                                                  'a custom no_sync_func is not supported when overlapping grad-reduce')
             config.no_sync_func = [model_chunk.no_sync for model_chunk in self.wrapped_models]
@@ -617,37 +631,6 @@ class BaseMegatronTrainer(ABC):
             disable_forward_pre_hook(self.wrapped_models, param_sync=False)
             self._saved_param_sync_func = config.param_sync_func
             config.param_sync_func = None
-
-        if args.nccl_comm_warmup:
-            # Eagerly create NCCL communicators while GPU memory is still free. Lazily-initialized
-            # comms (e.g. the dp/cp loss all-reduce and grad-sync coalescing) otherwise first fire
-            # at the iteration-1 memory peak, where NCCL's internal cudaMalloc can fail with
-            # "Failed to CUDA calloc async N bytes". A 1-element dummy all-reduce per group is
-            # numerically inert and forces the communicator to be created up front.
-            dummy = torch.zeros(1, device=get_current_device())
-            warmed = 0
-            for getter, kwargs in (
-                (mpu.get_data_parallel_group, {
-                    'with_context_parallel': True
-                }),
-                (mpu.get_data_parallel_group, {}),
-                (mpu.get_context_parallel_group, {}),
-                (mpu.get_tensor_model_parallel_group, {}),
-                (mpu.get_pipeline_model_parallel_group, {}),
-                (mpu.get_model_parallel_group, {}),
-                (mpu.get_embedding_group, {}),
-                (mpu.get_position_embedding_group, {}),
-            ):
-                try:
-                    group = getter(**kwargs)
-                except (AssertionError, ValueError, TypeError):
-                    continue
-                for g in (group if isinstance(group, list) else [group]):
-                    if g is not None:
-                        torch.distributed.all_reduce(dummy, group=g)
-                        warmed += 1
-            torch.cuda.synchronize()
-            logger.info(f'NCCL communicator warm-up done ({warmed} groups).')
 
         self.call_event('on_train_begin')
         self._train_metrics = {}
@@ -688,6 +671,14 @@ class BaseMegatronTrainer(ABC):
                 self._start_iteration = state.iteration + 1
 
         state.iteration += 1
+
+        # === SOFT EXCEPTION inject: rank 0 raises RuntimeError at iteration 25 ===
+        # 测试：rank 0 raise RuntimeError，不 kill 进程
+        # 预期：@tft_exception_handler 捕获异常，触发 TTP 紧急保存
+        if getattr(args, 'enable_high_availability', False) and args.rank == 1 and state.iteration == 201:
+            print(f"[INJECT-SOFT] rank {args.rank} raising RuntimeError at iteration {state.iteration}", flush=True)
+            raise RuntimeError("[INJECT-SOFT] test TTP without kill")
+        # === end inject ===
         self.call_event('on_step_end')
         self._aggregated_metrics(metrics, self._train_metrics)
         self._train_metrics['grad_norm'] = grad_norm
@@ -735,9 +726,55 @@ class BaseMegatronTrainer(ABC):
 
     def train(self, train_dataset, val_dataset):
         train_data_iterator, val_data_iterator = self.setup_training(train_dataset, val_dataset)
-        while self.state.iteration < self.args.train_iters:
-            self.run_train_step(train_data_iterator, val_data_iterator)
-        self.finalize_training()
+
+        # === Profiling: controlled by SWIFT_PROFILER_ENABLED env var ===
+        # Usage: SWIFT_PROFILER_ENABLED=1 megatron sft ...
+        # Optional: SWIFT_PROFILER_WAIT=10 SWIFT_PROFILER_WARMUP=3 SWIFT_PROFILER_ACTIVE=1
+        import os
+        profiler_enabled = os.environ.get('SWIFT_PROFILER_ENABLED', '0') == '1'
+
+        if profiler_enabled:
+            import torch_npu
+            wait = int(os.environ.get('SWIFT_PROFILER_WAIT', '10'))
+            warmup = int(os.environ.get('SWIFT_PROFILER_WARMUP', '3'))
+            active = int(os.environ.get('SWIFT_PROFILER_ACTIVE', '1'))
+            repeat = int(os.environ.get('SWIFT_PROFILER_REPEAT', '1'))
+
+            experimental_config = torch_npu.profiler._ExperimentalConfig(
+                aic_metrics=torch_npu.profiler.AiCMetrics.PipeUtilization,
+                profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
+                l2_cache=False,
+            )
+            prof_dir = os.path.join(self.args.output_dir, 'profiling')
+            os.makedirs(prof_dir, exist_ok=True)
+
+            logger.info(
+                f'[PROFILER] Enabled: wait={wait}, warmup={warmup}, '
+                f'active={active}, repeat={repeat}, output={prof_dir}'
+            )
+
+            with torch_npu.profiler.profile(
+                activities=[
+                    torch_npu.profiler.ProfilerActivity.NPU,
+                    torch_npu.profiler.ProfilerActivity.CPU,
+                ],
+                schedule=torch_npu.profiler.schedule(
+                    wait=wait, warmup=warmup, active=active, repeat=repeat
+                ),
+                on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(prof_dir),
+                record_shapes=False,
+                profile_memory=False,
+                with_stack=False,
+                experimental_config=experimental_config,
+            ) as prof:
+                while self.state.iteration < self.args.train_iters:
+                    self.run_train_step(train_data_iterator, val_data_iterator)
+                    prof.step()
+            self.finalize_training()
+        else:
+            while self.state.iteration < self.args.train_iters:
+                self.run_train_step(train_data_iterator, val_data_iterator)
+            self.finalize_training()
 
     def _determine_best_metric(self, metrics) -> bool:
         args = self.args
@@ -774,6 +811,21 @@ class BaseMegatronTrainer(ABC):
         state = self.state
         args.consumed_train_samples = state.consumed_train_samples
         iteration = state.iteration
+
+        # === TTP mode: save in emergency format (unified with fault checkpoint) ===
+        if getattr(args, 'enable_high_availability', False):
+            from swift.megatron.ttp.tft_emergency_checkpoint import save_ttp_checkpoint
+            save_ttp_checkpoint(self, iteration)
+            ckpt_dir = os.path.join(args.output_dir, f'checkpoint-{iteration:07d}-ttp')
+            state.last_model_checkpoint = ckpt_dir
+            if is_master():
+                # Copy args.json to checkpoint directory
+                args_path = os.path.join(args.output_dir, 'args.json')
+                if os.path.exists(args_path):
+                    self.copy_path(args_path, os.path.join(ckpt_dir, 'args.json'))
+                self._rotate_checkpoints(args.output_dir)
+            return
+        # === Original logic below ===
         output_dir = os.path.join(args.output_dir, f'checkpoint-{iteration}')
         os.makedirs(output_dir, exist_ok=True)
         args_path = os.path.join(os.path.dirname(output_dir), 'args.json')
